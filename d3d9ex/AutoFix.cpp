@@ -265,6 +265,10 @@ void MainContext::FF13_InitializeGameAddresses()
 	ff13_message_box_stack_push_address = baseAddr + 0xA8A982;
 	ff13_exe_large_address_aware_flag_address = baseAddr + 0x126;
 	ff13_exe_checksum_address = (uint32_t*)(baseAddr + 0x168);
+
+	// HD texture replacement — hash_database.txt and hd_textures/ live next to the DLL
+	std::wstring dllDir = ModuleDirectoryW(CurrentModule());
+	fontScaler.Init(dllDir);
 }
 
 void MainContext::FF13_HandleLargeAddressAwarePatch() {

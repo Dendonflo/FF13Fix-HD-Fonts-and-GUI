@@ -171,6 +171,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Context.h" />
+    <ClInclude Include="FontScaler.h" />
     <ClInclude Include="Wrapper.h" />
     <ClInclude Include="IDirect3D9.h" />
     <ClInclude Include="IDirect3DDevice9.h" />

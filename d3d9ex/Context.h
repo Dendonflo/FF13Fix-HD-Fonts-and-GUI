@@ -10,6 +10,7 @@
 
 #include "Types.h"
 #include "XInputManager.h"
+#include "FontScaler.h"
 
 static const char* inifilename = "FF13Fix.ini";
 #define CONFIG_VERSION 7
@@ -66,6 +67,7 @@ public:
 	void ApplyBorderless(HWND hWnd);
 
 	Config config;
+	FontScaler fontScaler;
 
 	void OneTimeFix();
 	bool IsDXVK();

@@ -50,6 +50,7 @@ ULONG STDMETHODCALLTYPE hkIDirect3DDevice9::Release() {
 		m_pWrapped->Release();
 		return ref;
 	}
+	context.fontScaler.ReleaseTextures();
 	const auto pWrapped = m_pWrapped;
 	m_pWrapped = nullptr;
 	delete this;
@@ -138,6 +139,7 @@ UINT APIENTRY hkIDirect3DDevice9::GetNumberOfSwapChains() {
 
 HRESULT APIENTRY hkIDirect3DDevice9::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
 	spdlog::debug("hkIDirect3DDevice9::Reset");
+	context.fontScaler.ReleaseTextures();
 	context.ApplyPresentationParameters(pPresentationParameters);
 	return m_pWrapped->Reset(pPresentationParameters);
 }
@@ -384,6 +386,7 @@ HRESULT APIENTRY hkIDirect3DDevice9::GetTexture(DWORD Stage, IDirect3DBaseTextur
 
 HRESULT APIENTRY hkIDirect3DDevice9::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture) {
 	spdlog::trace(__FUNCTION__);
+	pTexture = context.fontScaler.OnSetTexture(m_pWrapped, pTexture);
 	return m_pWrapped->SetTexture(Stage, pTexture);
 }
 
