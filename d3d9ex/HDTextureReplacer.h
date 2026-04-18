@@ -80,6 +80,10 @@ private:
     // Returns true if the key's namespace is a map namespace
     static bool IsMapTile(const std::string& key);
 
+    // Returns the trailing digits of a namespace (the scene number)
+    // e.g. "map_scene00023" -> "00023", "gui_scene00023" -> "00023"
+    static std::string ExtractSceneNumber(const std::string& ns);
+
     // Upload HD pixel data and return a new D3D9 texture (caller owns it)
     IDirect3DTexture9* CreateHDTexture(IDirect3DDevice9* pDevice, const std::string& texName);
 
@@ -338,9 +342,12 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
 
         if (ns != currentMapNamespace)
         {
-            FlushMapScene();
+            // Only flush when the scene NUMBER changes — different prefixes for the same
+            // scene number (e.g. "map_scene00023" vs "gui_scene00023") coexist in memory.
+            if (ExtractSceneNumber(ns) != ExtractSceneNumber(currentMapNamespace))
+                FlushMapScene();
             currentMapNamespace = ns;
-            spdlog::info("HDTextures: switched to map scene '{}'", ns);
+            spdlog::info("HDTextures: map namespace '{}'", ns);
         }
 
         if (hdData.find(texName) == hdData.end())
@@ -414,6 +421,13 @@ inline bool HDTextureReplacer::IsMapNamespace(const std::string& ns)
     return ns.substr(i - 5, 5) == "scene";
 }
 
+inline std::string HDTextureReplacer::ExtractSceneNumber(const std::string& ns)
+{
+    size_t i = ns.size();
+    while (i > 0 && std::isdigit((unsigned char)ns[i - 1])) --i;
+    return ns.substr(i);
+}
+
 inline bool HDTextureReplacer::IsMapTile(const std::string& key)
 {
     auto slash = key.find('/');
@@ -464,13 +478,13 @@ inline void HDTextureReplacer::FlushMapScene()
 {
     if (currentMapNamespace.empty()) return;
 
-    const std::string prefix = currentMapNamespace + "/";
-
-    // Collect all game pointers that belong to the current map scene
+    // Flush ALL map tile textures — multiple namespace prefixes (e.g. "map_scene00023"
+    // and "gui_scene00023") may have accumulated for the same scene number, so we
+    // wipe everything identified as a map tile rather than filtering by current prefix.
     std::vector<IDirect3DBaseTexture9*> toRemove;
     toRemove.reserve(pointerKey.size());
     for (auto& [ptr, key] : pointerKey)
-        if (key.compare(0, prefix.size(), prefix) == 0)
+        if (IsMapTile(key))
             toRemove.push_back(ptr);
 
     for (auto ptr : toRemove)
@@ -485,9 +499,9 @@ inline void HDTextureReplacer::FlushMapScene()
         pointerKey.erase(ptr);
     }
 
-    // Free lazily-loaded pixel data for the old scene (RAM reclaim)
+    // Free all lazily-loaded map tile pixel data (RAM reclaim)
     for (auto it = hdData.begin(); it != hdData.end(); )
-        it = (it->first.compare(0, prefix.size(), prefix) == 0) ? hdData.erase(it) : std::next(it);
+        it = IsMapTile(it->first) ? hdData.erase(it) : std::next(it);
 
     spdlog::info("HDTextures: flushed map scene '{}' ({} texture(s) released)",
                  currentMapNamespace, toRemove.size());
