@@ -8,24 +8,29 @@
 #include <sstream>
 #include <cstdint>
 #include <cstring>
+#include <cctype>
 #include <d3d9.h>
 
 #include "spdlog/spdlog.h"
 
 // Runtime HD texture replacement for FF XIII via content hashing.
+// Covers fonts, GUI elements, and map tiles.
 //
-// this system identifies textures by hashing their pixel data at runtime
+// This system identifies textures by hashing their pixel data at runtime
 // and looking up the hash in a pre-computed database.
 //
 // Flow:
 //   1. At startup, load hash_database.txt (hash -> texture name)
 //   2. Scan hd_textures/ folder for HD DDS replacement files
+//      - Non-map namespaces: pixel data loaded into RAM immediately
+//      - Map namespaces (*scene[0-9]+): only file paths indexed; loaded on demand
 //   3. On first SetTexture for each texture, lock it read-only, hash pixels,
 //      look up name in database
 //   4. If HD replacement exists for that name, create HD texture and swap
+//   5. On map scene change: flush old scene's textures and pixel data from memory
 //
 // Format-agnostic: works with DXT1, DXT5, etc.
-class FontScaler
+class HDTextureReplacer
 {
 public:
     void Init(const std::wstring& modDir);
@@ -36,6 +41,9 @@ public:
 
 
     void ReleaseTextures();
+
+    // Called from CreateTexture hook — evicts stale cache entries for reused pointers.
+    void InvalidateTexture(IDirect3DBaseTexture9* pTexture);
 
 private:
     struct HDTextureData {
@@ -56,12 +64,33 @@ private:
     // Textures already checked (no match or already mapped)
     std::unordered_set<IDirect3DBaseTexture9*> checkedTextures;
 
+    // game pointer -> texture key ("namespace/name")
+    // Kept for all matched textures so FlushMapScene can identify map-scene pointers
+    std::unordered_map<IDirect3DBaseTexture9*, std::string> pointerKey;
+
+    // Active map scene namespace (e.g. "scene00019"); empty until first map tile seen
+    std::string currentMapNamespace;
+
+    // Map tile paths indexed at startup: key -> full DDS path on disk (lazy-load source)
+    std::unordered_map<std::string, std::wstring> mapTilePaths;
+
+    // Returns true if ns matches the map-tile namespace pattern (*scene[0-9]+)
+    static bool IsMapNamespace(const std::string& ns);
+
+    // Returns true if the key's namespace is a map namespace
+    static bool IsMapTile(const std::string& key);
+
+    // Upload HD pixel data and return a new D3D9 texture (caller owns it)
+    IDirect3DTexture9* CreateHDTexture(IDirect3DDevice9* pDevice, const std::string& texName);
+
+    // Release all D3D9 textures, pixel data, and tracking entries for the current map scene
+    void FlushMapScene();
+
     void ScanHDSubdir(const std::wstring& subDirPath, const std::string& prefix);
 
     static bool ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                         D3DFORMAT& format, std::vector<uint8_t>& pixelData);
 
-    
     static uint64_t FNV1a64(const uint8_t* data, size_t len,
                             uint64_t h = 14695981039346656037ULL);
 
@@ -73,7 +102,7 @@ private:
 };
 
 
-inline uint64_t FontScaler::FNV1a64(const uint8_t* data, size_t len, uint64_t h)
+inline uint64_t HDTextureReplacer::FNV1a64(const uint8_t* data, size_t len, uint64_t h)
 {
     for (size_t i = 0; i < len; i++)
     {
@@ -84,14 +113,14 @@ inline uint64_t FontScaler::FNV1a64(const uint8_t* data, size_t len, uint64_t h)
 }
 
 
-inline bool FontScaler::IsBlockCompressed(D3DFORMAT format)
+inline bool HDTextureReplacer::IsBlockCompressed(D3DFORMAT format)
 {
     return format == D3DFMT_DXT1 || format == D3DFMT_DXT2 ||
            format == D3DFMT_DXT3 || format == D3DFMT_DXT4 ||
            format == D3DFMT_DXT5;
 }
 
-inline UINT FontScaler::GetBytesPerBlock(D3DFORMAT format)
+inline UINT HDTextureReplacer::GetBytesPerBlock(D3DFORMAT format)
 {
     switch (format) {
         case D3DFMT_DXT1: return 8;
@@ -101,7 +130,7 @@ inline UINT FontScaler::GetBytesPerBlock(D3DFORMAT format)
     }
 }
 
-inline UINT FontScaler::GetBytesPerPixel(D3DFORMAT format)
+inline UINT HDTextureReplacer::GetBytesPerPixel(D3DFORMAT format)
 {
     switch (format) {
         case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8: return 4;
@@ -113,7 +142,7 @@ inline UINT FontScaler::GetBytesPerPixel(D3DFORMAT format)
     }
 }
 
-inline UINT FontScaler::ComputeRowPitch(D3DFORMAT format, UINT width)
+inline UINT HDTextureReplacer::ComputeRowPitch(D3DFORMAT format, UINT width)
 {
     if (IsBlockCompressed(format))
         return ((width + 3) / 4) * GetBytesPerBlock(format);
@@ -121,7 +150,7 @@ inline UINT FontScaler::ComputeRowPitch(D3DFORMAT format, UINT width)
     return bpp ? width * bpp : 0;
 }
 
-inline UINT FontScaler::ComputeRowCount(D3DFORMAT format, UINT height)
+inline UINT HDTextureReplacer::ComputeRowCount(D3DFORMAT format, UINT height)
 {
     if (IsBlockCompressed(format))
         return (height + 3) / 4;
@@ -141,51 +170,66 @@ static std::string StripDDSExtension(const std::string& fname)
 
 // Scan one subdirectory of hd_textures/ and load all DDS files into hdData.
 // key = "subdir/texturename" (e.g. "gui_resident/wfnt16")
-inline void FontScaler::ScanHDSubdir(const std::wstring& subDirPath,
+inline void HDTextureReplacer::ScanHDSubdir(const std::wstring& subDirPath,
                                       const std::string& prefix)
 {
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW((subDirPath + L"\\*.dds").c_str(), &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
 
+    const bool isMap = IsMapNamespace(prefix);
+    int count = 0;
+
     do
     {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
 
         std::wstring filePath = subDirPath + L"\\" + fd.cFileName;
+        std::wstring fnameW   = fd.cFileName;
+        std::string  fname(fnameW.begin(), fnameW.end());
+        std::string  key = prefix + "/" + StripDDSExtension(fname);
 
-        UINT hdW, hdH;
-        D3DFORMAT format;
-        std::vector<uint8_t> pixels;
-        if (!ReadDDS(filePath, hdW, hdH, format, pixels))
-            continue;
+        if (isMap)
+        {
+            // Map tile: record the path on disk only — pixel data loaded on demand
+            mapTilePaths[key] = filePath;
+        }
+        else
+        {
+            // Non-map (fonts, UI, etc.): load pixel data into RAM now
+            UINT hdW, hdH;
+            D3DFORMAT format;
+            std::vector<uint8_t> pixels;
+            if (!ReadDDS(filePath, hdW, hdH, format, pixels))
+                continue;
 
-        std::wstring fnameW = fd.cFileName;
-        std::string fname(fnameW.begin(), fnameW.end());
-        std::string key = prefix + "/" + StripDDSExtension(fname);
+            HDTextureData hd;
+            hd.hdW = hdW;
+            hd.hdH = hdH;
+            hd.format = format;
+            hd.pixelData = std::move(pixels);
 
-        HDTextureData hd;
-        hd.hdW = hdW;
-        hd.hdH = hdH;
-        hd.format = format;
-        hd.pixelData = std::move(pixels);
-
-        spdlog::info("FontScaler: HD texture '{}' loaded ({}x{}, {} bytes)",
-                     key, hdW, hdH, hd.pixelData.size());
-        hdData[key] = std::move(hd);
+            spdlog::info("HDTextures: HD texture '{}' loaded ({}x{}, {} bytes)",
+                         key, hdW, hdH, hd.pixelData.size());
+            hdData[key] = std::move(hd);
+        }
+        ++count;
 
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
+
+    if (isMap)
+        spdlog::info("HDTextures: map scene '{}': {} tile(s) indexed for lazy load", prefix, count);
 }
 
-inline void FontScaler::Init(const std::wstring& modDir)
+inline void HDTextureReplacer::Init(const std::wstring& modDir)
 {
     std::wstring hashDBPath = modDir + L"\\hash_database.txt";
     {
         std::ifstream f(hashDBPath);
         if (!f.is_open())
         {
-            spdlog::info("FontScaler: no hash_database.txt found, texture replacement disabled");
+            spdlog::info("HDTextures: no hash_database.txt found, texture replacement disabled");
             return;
         }
 
@@ -202,7 +246,7 @@ inline void FontScaler::Init(const std::wstring& modDir)
             uint64_t hash = std::strtoull(hashStr.c_str(), nullptr, 16);
             hashDB[hash] = name;
         }
-        spdlog::info("FontScaler: loaded {} entries from hash database", hashDB.size());
+        spdlog::info("HDTextures: loaded {} entries from hash database", hashDB.size());
     }
 
     // --- Scan hd_textures/<subdir>/*.dds ---
@@ -212,7 +256,7 @@ inline void FontScaler::Init(const std::wstring& modDir)
     DWORD attr = GetFileAttributesW(hdRoot.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
     {
-        spdlog::info("FontScaler: no hd_textures directory found");
+        spdlog::info("HDTextures: no hd_textures directory found");
         return;
     }
 
@@ -235,28 +279,27 @@ inline void FontScaler::Init(const std::wstring& modDir)
     FindClose(hFind);
 
     if (!hdData.empty())
-        spdlog::info("FontScaler: {} HD texture(s) available for replacement", hdData.size());
+        spdlog::info("HDTextures:{} HD texture(s) available for replacement", hdData.size());
 }
 
 // OnSetTexture — identify texture by hash, swap if HD replacement available
-inline IDirect3DBaseTexture9* FontScaler::OnSetTexture(IDirect3DDevice9* pDevice,
+inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* pDevice,
                                                         IDirect3DBaseTexture9* pTexture)
 {
     if (!pTexture || hashDB.empty()) return pTexture;
 
-    // Fast path: already mapped to HD
+    // Fast path: already mapped to an HD texture
     auto mapIt = textureMap.find(pTexture);
     if (mapIt != textureMap.end())
         return mapIt->second;
 
-    // Already checked, no match
+    // Already checked with no match — skip
     if (checkedTextures.count(pTexture))
         return pTexture;
 
     // --- First time seeing this texture: identify by hashing ---
     checkedTextures.insert(pTexture);
 
-    // Only handle 2D textures
     if (pTexture->GetType() != D3DRTYPE_TEXTURE)
         return pTexture;
 
@@ -271,14 +314,10 @@ inline IDirect3DBaseTexture9* FontScaler::OnSetTexture(IDirect3DDevice9* pDevice
     if (rowPitch == 0 || rowCount == 0)
         return pTexture;
 
-    // Lock texture read-only to hash its pixel data
     D3DLOCKED_RECT locked;
     if (FAILED(tex->LockRect(0, &locked, nullptr, D3DLOCK_READONLY)))
         return pTexture;
 
-    // Hash row-by-row to handle potential pitch padding.
-    // Streaming FNV-1a: hash(row0 ++ row1 ++ ...) matches the pre-computed
-    // hash from the contiguous DDS pixel data.
     uint64_t h = 14695981039346656037ULL;
     const uint8_t* bits = static_cast<const uint8_t*>(locked.pBits);
     for (UINT row = 0; row < rowCount; row++)
@@ -286,78 +325,176 @@ inline IDirect3DBaseTexture9* FontScaler::OnSetTexture(IDirect3DDevice9* pDevice
 
     tex->UnlockRect(0);
 
-    // Look up hash in database
     auto dbIt = hashDB.find(h);
     if (dbIt == hashDB.end())
         return pTexture;
 
     const std::string& texName = dbIt->second;
 
-    // Check if we have an HD replacement for this name
-    auto hdIt = hdData.find(texName);
-    if (hdIt == hdData.end())
+    // Map tile: switch scene if namespace changed, then lazy-load pixel data
+    if (IsMapTile(texName))
+    {
+        const std::string ns = texName.substr(0, texName.find('/'));
+
+        if (ns != currentMapNamespace)
+        {
+            FlushMapScene();
+            currentMapNamespace = ns;
+            spdlog::info("HDTextures: switched to map scene '{}'", ns);
+        }
+
+        if (hdData.find(texName) == hdData.end())
+        {
+            auto pathIt = mapTilePaths.find(texName);
+            if (pathIt != mapTilePaths.end())
+            {
+                UINT hdW, hdH;
+                D3DFORMAT format;
+                std::vector<uint8_t> pixels;
+                if (ReadDDS(pathIt->second, hdW, hdH, format, pixels))
+                {
+                    HDTextureData hd;
+                    hd.hdW = hdW; hd.hdH = hdH;
+                    hd.format = format;
+                    hd.pixelData = std::move(pixels);
+                    spdlog::info("HDTextures: lazy-loaded map tile '{}' ({}x{})", texName, hdW, hdH);
+                    hdData[texName] = std::move(hd);
+                }
+            }
+        }
+    }
+
+    IDirect3DTexture9* hdTex = CreateHDTexture(pDevice, texName);
+    if (!hdTex)
         return pTexture;
 
+    textureMap[pTexture] = hdTex;
+    pointerKey[pTexture] = texName;
+
+    spdlog::info("HDTextures: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
+                 texName, h, desc.Width, desc.Height,
+                 hdData.at(texName).hdW, hdData.at(texName).hdH);
+
+    return hdTex;
+}
+
+
+inline void HDTextureReplacer::ReleaseTextures()
+{
+    for (auto& pair : textureMap)
+        if (pair.second) pair.second->Release();
+    textureMap.clear();
+    checkedTextures.clear();
+    pointerKey.clear();
+    currentMapNamespace.clear();
+    // Free lazily-loaded map tile pixel data (non-map hdData stays — loaded at Init)
+    for (auto it = hdData.begin(); it != hdData.end(); )
+        it = IsMapTile(it->first) ? hdData.erase(it) : std::next(it);
+}
+
+inline void HDTextureReplacer::InvalidateTexture(IDirect3DBaseTexture9* pTexture)
+{
+    auto it = textureMap.find(pTexture);
+    if (it != textureMap.end())
+    {
+        if (it->second) it->second->Release();
+        textureMap.erase(it);
+    }
+    checkedTextures.erase(pTexture);
+    pointerKey.erase(pTexture);
+}
+
+inline bool HDTextureReplacer::IsMapNamespace(const std::string& ns)
+{
+    // Strip trailing digits
+    size_t i = ns.size();
+    while (i > 0 && std::isdigit((unsigned char)ns[i - 1])) --i;
+    // Must end with "scene" before the digits (e.g. "scene00019", "map_scene00019")
+    if (i == ns.size() || i < 5) return false;
+    return ns.substr(i - 5, 5) == "scene";
+}
+
+inline bool HDTextureReplacer::IsMapTile(const std::string& key)
+{
+    auto slash = key.find('/');
+    if (slash == std::string::npos) return false;
+    return IsMapNamespace(key.substr(0, slash));
+}
+
+inline IDirect3DTexture9* HDTextureReplacer::CreateHDTexture(IDirect3DDevice9* pDevice,
+                                                       const std::string& texName)
+{
+    auto hdIt = hdData.find(texName);
+    if (hdIt == hdData.end()) return nullptr;
     const HDTextureData& hd = hdIt->second;
 
-    // Create HD texture
     IDirect3DTexture9* hdTex = nullptr;
     HRESULT hr = pDevice->CreateTexture(hd.hdW, hd.hdH, 1, 0,
                                         hd.format, D3DPOOL_MANAGED,
                                         &hdTex, nullptr);
     if (FAILED(hr))
     {
-        spdlog::error("FontScaler: failed to create {}x{} HD texture for '{}' (hr=0x{:08X})",
-                      hd.hdW, hd.hdH, texName, (unsigned)hr);
-        return pTexture;
+        spdlog::error("HDTextures: failed to create HD texture for '{}' (hr=0x{:08X})",
+                      texName, (unsigned)hr);
+        return nullptr;
     }
 
-    // Lock and fill with HD pixel data
     D3DLOCKED_RECT hdLocked;
     hr = hdTex->LockRect(0, &hdLocked, nullptr, 0);
     if (FAILED(hr))
     {
-        spdlog::error("FontScaler: failed to lock HD texture for '{}' (hr=0x{:08X})",
+        spdlog::error("HDTextures: failed to lock HD texture for '{}' (hr=0x{:08X})",
                       texName, (unsigned)hr);
         hdTex->Release();
-        return pTexture;
+        return nullptr;
     }
 
     UINT hdRowPitch = ComputeRowPitch(hd.format, hd.hdW);
     UINT hdRowCount = ComputeRowCount(hd.format, hd.hdH);
     const uint8_t* src = hd.pixelData.data();
-
     for (UINT row = 0; row < hdRowCount; row++)
-    {
         memcpy(static_cast<uint8_t*>(hdLocked.pBits) + row * hdLocked.Pitch,
-               src + row * hdRowPitch,
-               hdRowPitch);
-    }
+               src + row * hdRowPitch, hdRowPitch);
 
     hdTex->UnlockRect(0);
-
-    textureMap[pTexture] = hdTex;
-
-    spdlog::info("FontScaler: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
-                 texName, h, desc.Width, desc.Height, hd.hdW, hd.hdH);
-
     return hdTex;
 }
 
-
-inline void FontScaler::ReleaseTextures()
+inline void HDTextureReplacer::FlushMapScene()
 {
-    for (auto& pair : textureMap)
+    if (currentMapNamespace.empty()) return;
+
+    const std::string prefix = currentMapNamespace + "/";
+
+    // Collect all game pointers that belong to the current map scene
+    std::vector<IDirect3DBaseTexture9*> toRemove;
+    toRemove.reserve(pointerKey.size());
+    for (auto& [ptr, key] : pointerKey)
+        if (key.compare(0, prefix.size(), prefix) == 0)
+            toRemove.push_back(ptr);
+
+    for (auto ptr : toRemove)
     {
-        if (pair.second)
-            pair.second->Release();
+        auto it = textureMap.find(ptr);
+        if (it != textureMap.end())
+        {
+            if (it->second) it->second->Release();
+            textureMap.erase(it);
+        }
+        checkedTextures.erase(ptr);
+        pointerKey.erase(ptr);
     }
-    textureMap.clear();
-    checkedTextures.clear();
+
+    // Free lazily-loaded pixel data for the old scene (RAM reclaim)
+    for (auto it = hdData.begin(); it != hdData.end(); )
+        it = (it->first.compare(0, prefix.size(), prefix) == 0) ? hdData.erase(it) : std::next(it);
+
+    spdlog::info("HDTextures: flushed map scene '{}' ({} texture(s) released)",
+                 currentMapNamespace, toRemove.size());
 }
 
 // ReadDDS — parse DDS header for dimensions and format, read pixel data
-inline bool FontScaler::ReadDDS(const std::wstring& path, UINT& width, UINT& height,
+inline bool HDTextureReplacer::ReadDDS(const std::wstring& path, UINT& width, UINT& height,
                                  D3DFORMAT& format, std::vector<uint8_t>& pixelData)
 {
     std::ifstream f(path, std::ios::binary);
@@ -390,7 +527,7 @@ inline bool FontScaler::ReadDDS(const std::wstring& path, UINT& width, UINT& hei
             format = D3DFMT_A4R4G4B4;
         else
         {
-            spdlog::warn("FontScaler: unsupported RGB bit count {} in DDS", rgbBitCount);
+            spdlog::warn("HDTextures: unsupported RGB bit count {} in DDS", rgbBitCount);
             return false;
         }
     }
@@ -400,7 +537,7 @@ inline bool FontScaler::ReadDDS(const std::wstring& path, UINT& width, UINT& hei
             format = D3DFMT_L8;
         else
         {
-            spdlog::warn("FontScaler: unsupported luminance bit count {} in DDS", rgbBitCount);
+            spdlog::warn("HDTextures: unsupported luminance bit count {} in DDS", rgbBitCount);
             return false;
         }
     }
@@ -410,13 +547,13 @@ inline bool FontScaler::ReadDDS(const std::wstring& path, UINT& width, UINT& hei
             format = D3DFMT_A8;
         else
         {
-            spdlog::warn("FontScaler: unsupported alpha bit count {} in DDS", rgbBitCount);
+            spdlog::warn("HDTextures: unsupported alpha bit count {} in DDS", rgbBitCount);
             return false;
         }
     }
     else
     {
-        spdlog::warn("FontScaler: unsupported DDS format (fourCC=0x{:08X}, flags=0x{:08X})",
+        spdlog::warn("HDTextures: unsupported DDS format (fourCC=0x{:08X}, flags=0x{:08X})",
                      fourCC, pfFlags);
         return false;
     }

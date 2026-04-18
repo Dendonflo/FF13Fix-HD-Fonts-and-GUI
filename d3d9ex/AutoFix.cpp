@@ -268,7 +268,7 @@ void MainContext::FF13_InitializeGameAddresses()
 
 	// HD texture replacement — hash_database.txt and hd_textures/ live next to the DLL
 	std::wstring dllDir = ModuleDirectoryW(CurrentModule());
-	fontScaler.Init(dllDir);
+	hdTextures.Init(dllDir);
 }
 
 void MainContext::FF13_HandleLargeAddressAwarePatch() {

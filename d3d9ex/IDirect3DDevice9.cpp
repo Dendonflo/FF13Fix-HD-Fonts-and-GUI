@@ -50,7 +50,7 @@ ULONG STDMETHODCALLTYPE hkIDirect3DDevice9::Release() {
 		m_pWrapped->Release();
 		return ref;
 	}
-	context.fontScaler.ReleaseTextures();
+	context.hdTextures.ReleaseTextures();
 	const auto pWrapped = m_pWrapped;
 	m_pWrapped = nullptr;
 	delete this;
@@ -139,7 +139,7 @@ UINT APIENTRY hkIDirect3DDevice9::GetNumberOfSwapChains() {
 
 HRESULT APIENTRY hkIDirect3DDevice9::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
 	spdlog::debug("hkIDirect3DDevice9::Reset");
-	context.fontScaler.ReleaseTextures();
+	context.hdTextures.ReleaseTextures();
 	context.ApplyPresentationParameters(pPresentationParameters);
 	return m_pWrapped->Reset(pPresentationParameters);
 }
@@ -176,7 +176,10 @@ void APIENTRY hkIDirect3DDevice9::GetGammaRamp(UINT iSwapChain, D3DGAMMARAMP* pR
 
 HRESULT APIENTRY hkIDirect3DDevice9::CreateTexture(UINT Width, UINT Height, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DTexture9** ppTexture, HANDLE* pSharedHandle) {
 	spdlog::trace(__FUNCTION__);
-	return m_pWrapped->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
+	HRESULT hr = m_pWrapped->CreateTexture(Width, Height, Levels, Usage, Format, Pool, ppTexture, pSharedHandle);
+	if (SUCCEEDED(hr) && ppTexture && *ppTexture)
+		context.hdTextures.InvalidateTexture(*ppTexture);
+	return hr;
 }
 
 HRESULT APIENTRY hkIDirect3DDevice9::CreateVolumeTexture(UINT Width, UINT Height, UINT Depth, UINT Levels, DWORD Usage, D3DFORMAT Format, D3DPOOL Pool, IDirect3DVolumeTexture9** ppVolumeTexture, HANDLE* pSharedHandle) {
@@ -386,7 +389,7 @@ HRESULT APIENTRY hkIDirect3DDevice9::GetTexture(DWORD Stage, IDirect3DBaseTextur
 
 HRESULT APIENTRY hkIDirect3DDevice9::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture) {
 	spdlog::trace(__FUNCTION__);
-	pTexture = context.fontScaler.OnSetTexture(m_pWrapped, pTexture);
+	pTexture = context.hdTextures.OnSetTexture(m_pWrapped, pTexture);
 	return m_pWrapped->SetTexture(Stage, pTexture);
 }
 
