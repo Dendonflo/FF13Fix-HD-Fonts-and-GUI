@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <list>
 #include <unordered_map>
 #include <unordered_set>
 #include <fstream>
@@ -74,6 +75,18 @@ private:
     // Map tile paths indexed at startup: key -> full DDS path on disk (lazy-load source)
     std::unordered_map<std::string, std::wstring> mapTilePaths;
 
+    // Map tile name -> live D3D9 texture (owner for map tiles; textureMap is non-owning for maps)
+    std::unordered_map<std::string, IDirect3DTexture9*> nameToHDTex;
+
+    // LRU order for map tiles: front = most recently used, back = oldest
+    std::list<std::string> lruOrder;
+    std::unordered_map<std::string, std::list<std::string>::iterator> lruIndex;
+
+    // Maximum number of HD map tile textures kept alive simultaneously.
+    // 58 is the largest scene tile count observed; 128 gives comfortable headroom
+    // for multiple namespace prefixes (map_scene + gui_scene) within the same scene.
+    static constexpr size_t MAP_TILE_LRU_CAP = 128;
+
     // Returns true if ns matches the map-tile namespace pattern (*scene[0-9]+)
     static bool IsMapNamespace(const std::string& ns);
 
@@ -89,6 +102,9 @@ private:
 
     // Release all D3D9 textures, pixel data, and tracking entries for the current map scene
     void FlushMapScene();
+
+    // Evict the least-recently-used map tile texture to reclaim VRAM/RAM
+    void EvictOldestMapTile();
 
     void ScanHDSubdir(const std::wstring& subDirPath, const std::string& prefix);
 
@@ -350,6 +366,22 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
             spdlog::info("HDTextures: map namespace '{}'", ns);
         }
 
+        // If the HD texture is already resident (e.g. game reused a different pointer
+        // for a tile we've already loaded), reuse it — no disk read, no upload.
+        auto nameIt = nameToHDTex.find(texName);
+        if (nameIt != nameToHDTex.end())
+        {
+            // Touch LRU
+            lruOrder.erase(lruIndex[texName]);
+            lruOrder.push_front(texName);
+            lruIndex[texName] = lruOrder.begin();
+
+            textureMap[pTexture] = nameIt->second;
+            pointerKey[pTexture] = texName;
+            return nameIt->second;
+        }
+
+        // Not yet resident — lazy load pixel data from disk
         if (hdData.find(texName) == hdData.end())
         {
             auto pathIt = mapTilePaths.find(texName);
@@ -378,6 +410,17 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
     textureMap[pTexture] = hdTex;
     pointerKey[pTexture] = texName;
 
+    // Map tiles: register in nameToHDTex (takes ownership) and LRU
+    if (IsMapTile(texName))
+    {
+        nameToHDTex[texName] = hdTex;
+        lruOrder.push_front(texName);
+        lruIndex[texName] = lruOrder.begin();
+
+        while (lruOrder.size() > MAP_TILE_LRU_CAP)
+            EvictOldestMapTile();
+    }
+
     spdlog::info("HDTextures: '{}' matched by hash {:016x}, swapped to HD ({}x{} -> {}x{})",
                  texName, h, desc.Width, desc.Height,
                  hdData.at(texName).hdW, hdData.at(texName).hdH);
@@ -388,9 +431,22 @@ inline IDirect3DBaseTexture9* HDTextureReplacer::OnSetTexture(IDirect3DDevice9* 
 
 inline void HDTextureReplacer::ReleaseTextures()
 {
-    for (auto& pair : textureMap)
-        if (pair.second) pair.second->Release();
+    // Non-map textures: owned by textureMap — release here
+    for (auto& [ptr, tex] : textureMap)
+    {
+        auto keyIt = pointerKey.find(ptr);
+        bool isMap = keyIt != pointerKey.end() && IsMapTile(keyIt->second);
+        if (!isMap && tex) tex->Release();
+    }
     textureMap.clear();
+
+    // Map textures: owned by nameToHDTex — release here
+    for (auto& [name, tex] : nameToHDTex)
+        if (tex) tex->Release();
+    nameToHDTex.clear();
+    lruOrder.clear();
+    lruIndex.clear();
+
     checkedTextures.clear();
     pointerKey.clear();
     currentMapNamespace.clear();
@@ -404,7 +460,10 @@ inline void HDTextureReplacer::InvalidateTexture(IDirect3DBaseTexture9* pTexture
     auto it = textureMap.find(pTexture);
     if (it != textureMap.end())
     {
-        if (it->second) it->second->Release();
+        // Map tiles: owned by nameToHDTex, do not release from textureMap
+        auto keyIt = pointerKey.find(pTexture);
+        bool isMap = keyIt != pointerKey.end() && IsMapTile(keyIt->second);
+        if (!isMap && it->second) it->second->Release();
         textureMap.erase(it);
     }
     checkedTextures.erase(pTexture);
@@ -474,13 +533,55 @@ inline IDirect3DTexture9* HDTextureReplacer::CreateHDTexture(IDirect3DDevice9* p
     return hdTex;
 }
 
+inline void HDTextureReplacer::EvictOldestMapTile()
+{
+    if (lruOrder.empty()) return;
+
+    const std::string name = lruOrder.back();
+    lruOrder.pop_back();
+    lruIndex.erase(name);
+
+    // Release the HD texture (nameToHDTex is the owner for map tiles)
+    auto hdTexIt = nameToHDTex.find(name);
+    if (hdTexIt != nameToHDTex.end())
+    {
+        if (hdTexIt->second) hdTexIt->second->Release();
+        nameToHDTex.erase(hdTexIt);
+    }
+
+    // Remove all textureMap and tracking entries pointing to this tile.
+    // textureMap is non-owning for map tiles — no Release.
+    std::vector<IDirect3DBaseTexture9*> toRemove;
+    for (auto& [ptr, key] : pointerKey)
+        if (key == name)
+            toRemove.push_back(ptr);
+
+    for (auto ptr : toRemove)
+    {
+        textureMap.erase(ptr);
+        checkedTextures.erase(ptr);
+        pointerKey.erase(ptr);
+    }
+
+    // hdData kept — allows fast recreation from RAM if tile is accessed again
+    spdlog::info("HDTextures: LRU evicted '{}' ({} pointer(s) removed)", name, toRemove.size());
+}
+
 inline void HDTextureReplacer::FlushMapScene()
 {
     if (currentMapNamespace.empty()) return;
 
-    // Flush ALL map tile textures — multiple namespace prefixes (e.g. "map_scene00023"
-    // and "gui_scene00023") may have accumulated for the same scene number, so we
-    // wipe everything identified as a map tile rather than filtering by current prefix.
+    // Release all map HD textures via nameToHDTex (owner).
+    // Multiple namespace prefixes (map_scene + gui_scene) for the same scene number
+    // may be present — nameToHDTex covers all of them.
+    size_t released = nameToHDTex.size();
+    for (auto& [name, tex] : nameToHDTex)
+        if (tex) tex->Release();
+    nameToHDTex.clear();
+    lruOrder.clear();
+    lruIndex.clear();
+
+    // Clean up textureMap and tracking entries for map tiles (non-owning, no Release)
     std::vector<IDirect3DBaseTexture9*> toRemove;
     toRemove.reserve(pointerKey.size());
     for (auto& [ptr, key] : pointerKey)
@@ -489,12 +590,7 @@ inline void HDTextureReplacer::FlushMapScene()
 
     for (auto ptr : toRemove)
     {
-        auto it = textureMap.find(ptr);
-        if (it != textureMap.end())
-        {
-            if (it->second) it->second->Release();
-            textureMap.erase(it);
-        }
+        textureMap.erase(ptr);
         checkedTextures.erase(ptr);
         pointerKey.erase(ptr);
     }
@@ -503,8 +599,8 @@ inline void HDTextureReplacer::FlushMapScene()
     for (auto it = hdData.begin(); it != hdData.end(); )
         it = IsMapTile(it->first) ? hdData.erase(it) : std::next(it);
 
-    spdlog::info("HDTextures: flushed map scene '{}' ({} texture(s) released)",
-                 currentMapNamespace, toRemove.size());
+    spdlog::info("HDTextures: flushed map scene '{}' ({} HD texture(s), {} pointer(s) released)",
+                 currentMapNamespace, released, toRemove.size());
 }
 
 // ReadDDS — parse DDS header for dimensions and format, read pixel data
