@@ -105,5 +105,18 @@ SETTING(bool, BoolValue, LogFlush, Log, false,
 	L"#  false = flush log file only when error level message is logged (default)"
 );
 
+SETTING(std::wstring, StringValue, LazyLoadPrefixes, HDTextures, L"map_scene;monster;shop",
+	L"# LazyLoadPrefixes\n"
+	L"#\n"
+	L"# Semicolon-separated list of namespace prefixes whose tiles are loaded from\n"
+	L"# disk on demand rather than preloaded into RAM at startup.\n"
+	L"# Only applies to numbered namespaces (those whose folder names end in digits).\n"
+	L"#\n"
+	L"# ⚠️  DO NOT CHANGE THIS unless you know exactly what you are doing.\n"
+	L"# Incorrect settings can cause stuttering, crashes, or out-of-memory errors.\n"
+	L"#\n"
+	L"# Example: map_scene;monster;shop;another_namespace\n"
+	L"# Default: map_scene;monster;shop"
+);
 
 #endif

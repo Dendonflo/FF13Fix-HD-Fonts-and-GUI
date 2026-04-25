@@ -13,7 +13,7 @@
 #include "HDTextureReplacer.h"
 
 static const char* inifilename = "FF13Fix.ini";
-#define CONFIG_VERSION 7
+#define CONFIG_VERSION 8
 
 class Config
 {
